@@ -9,12 +9,9 @@ import (
 	"math"
 	"net/http"
 	"net/url"
-	"sync"
 	"syscall"
 	"time"
 )
-
-const qWaitMax = 2
 
 type getter struct {
 	url   url.URL
@@ -28,12 +25,11 @@ type getter struct {
 	bytesRead  int64
 	chunkTotal int
 
-	readCh   chan *chunk
-	getCh    chan *chunk
-	quit     chan struct{}
-	qWait    map[int]*chunk
-	qWaitLen uint
-	cond     sync.Cond
+	getCh chan *chunk
+	quit  chan struct{}
+
+	chanRing     []chan *chunk
+	serialisedCh chan *chunk
 
 	sp *bp
 
@@ -45,11 +41,12 @@ type getter struct {
 }
 
 type chunk struct {
-	id     int
-	header http.Header
-	start  int64
-	size   int64
-	b      []byte
+	id         int64
+	header     http.Header
+	start      int64
+	size       int64
+	b          []byte
+	completion chan *chunk
 }
 
 func newGetter(getURL url.URL, c *Config, b *Bucket) (io.ReadCloser, http.Header, error) {
@@ -62,12 +59,16 @@ func newGetter(getURL url.URL, c *Config, b *Bucket) (io.ReadCloser, http.Header
 	g.c.Concurrency = max(c.Concurrency, 1)
 
 	g.getCh = make(chan *chunk)
-	g.readCh = make(chan *chunk)
 	g.quit = make(chan struct{})
-	g.qWait = make(map[int]*chunk)
 	g.b = b
 	g.md5 = md5.New()
-	g.cond = sync.Cond{L: &sync.Mutex{}}
+
+	g.chanRing = make([]chan *chunk, g.c.Concurrency)
+	g.serialisedCh = make(chan *chunk, 1)
+
+	for i := 0; i < g.c.Concurrency; i++ {
+		g.chanRing[i] = make(chan *chunk, 1)
+	}
 
 	// use get instead of head for error messaging
 	resp, err := g.retryRequest("GET", g.url.String(), nil)
@@ -95,6 +96,7 @@ func newGetter(getURL url.URL, c *Config, b *Bucket) (io.ReadCloser, http.Header
 		go g.worker()
 	}
 	go g.initChunks()
+	go g.serialiseChunks()
 	return g, resp.Header, nil
 }
 
@@ -126,7 +128,7 @@ func (g *getter) retryRequest(method, urlStr string, body io.ReadSeeker) (resp *
 }
 
 func (g *getter) initChunks() {
-	id := 0
+	id := int64(0)
 	for i := int64(0); i < g.contentLen; {
 		size := min64(g.bufsz, g.contentLen-i)
 		c := &chunk{
@@ -135,15 +137,29 @@ func (g *getter) initChunks() {
 				"Range": {fmt.Sprintf("bytes=%d-%d",
 					i, i+size-1)},
 			},
-			start: i,
-			size:  size,
-			b:     nil,
+			start:      i,
+			size:       size,
+			b:          nil,
+			completion: g.chanRing[id%int64(g.c.Concurrency)],
 		}
 		i += size
 		id++
 		g.getCh <- c
 	}
 	close(g.getCh)
+}
+
+func (g *getter) serialiseChunks() {
+	id := int64(0)
+	for i := int64(0); i < g.contentLen; {
+		size := min64(g.bufsz, g.contentLen-i)
+
+		c := <-g.chanRing[id%int64(g.c.Concurrency)]
+		g.serialisedCh <- c
+
+		i += size
+		id++
+	}
 }
 
 func (g *getter) worker() {
@@ -198,17 +214,9 @@ func (g *getter) getChunk(c *chunk) error {
 		return fmt.Errorf("chunk %d: Expected %d bytes, received %d",
 			c.id, c.size, n)
 	}
-	g.readCh <- c
 
-	// wait for qWait to drain before starting next chunk
-	g.cond.L.Lock()
-	for g.qWaitLen >= qWaitMax {
-		if g.closed {
-			return nil
-		}
-		g.cond.Wait()
-	}
-	g.cond.L.Unlock()
+	c.completion <- c
+
 	return nil
 }
 
@@ -260,33 +268,13 @@ func (g *getter) Read(p []byte) (int, error) {
 }
 
 func (g *getter) nextChunk() (*chunk, error) {
-	for {
-		// first check qWait
-		c := g.qWait[g.chunkID]
-		if c != nil {
-			delete(g.qWait, g.chunkID)
-			g.cond.L.Lock()
-			g.qWaitLen--
-			g.cond.L.Unlock()
-			g.cond.Signal() // wake up waiting worker goroutine
-			if g.c.Md5Check {
-				if _, err := g.md5.Write(c.b[:c.size]); err != nil {
-					return nil, err
-				}
-			}
-			return c, nil
-		}
-		// if next chunk not in qWait, read from channel
-		select {
-		case c := <-g.readCh:
-			g.qWait[c.id] = c
-			g.cond.L.Lock()
-			g.qWaitLen++
-			g.cond.L.Unlock()
-		case <-g.quit:
-			return nil, g.err // fatal error, quit.
+	c := <-g.serialisedCh
+	if g.c.Md5Check {
+		if _, err := g.md5.Write(c.b[:c.size]); err != nil {
+			return nil, err
 		}
 	}
+	return c, nil
 }
 
 func (g *getter) Close() error {
@@ -296,7 +284,6 @@ func (g *getter) Close() error {
 	g.closed = true
 	close(g.sp.quit)
 	close(g.quit)
-	g.cond.Broadcast()
 	if g.err != nil {
 		return g.err
 	}
